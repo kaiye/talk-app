@@ -1,4 +1,31 @@
-import type { Settings } from './settings'
+import { DEFAULT_SETTINGS, type Settings } from './settings'
+import {
+  buildGatewayDeviceAuth,
+  DEFAULT_GATEWAY_SESSION_KEY,
+  getGatewayErrorInfo,
+  getGatewayErrorMessage,
+  OPERATOR_SCOPES,
+  parseGatewayChatPayload,
+} from './gatewayProtocol'
+
+const readApiErrorMessage = async (res: Response): Promise<string | null> => {
+  try {
+    const data = await res.json()
+    const msg =
+      (typeof data?.message === 'string' && data.message) ||
+      (typeof data?.error?.message === 'string' && data.error.message) ||
+      (typeof data?.error === 'string' && data.error) ||
+      null
+    return msg ? msg.trim() : null
+  } catch {
+    try {
+      const text = (await res.text()).trim()
+      return text || null
+    } catch {
+      return null
+    }
+  }
+}
 
 export async function transcribeAudio(
   blob: Blob,
@@ -22,6 +49,17 @@ export async function transcribeAudio(
 
 export async function sendToGateway(text: string, s: Settings): Promise<string> {
   return new Promise((resolve, reject) => {
+    const gatewayUrl = typeof s.gateway.url === 'string' ? s.gateway.url.trim() : ''
+    const gatewayToken = typeof s.gateway.token === 'string' ? s.gateway.token.trim() : ''
+    if (!gatewayUrl) {
+      reject(new Error('Gateway URL 为空，请在设置中填写 wss://... 地址'))
+      return
+    }
+    if (!/^wss?:\/\//i.test(gatewayUrl)) {
+      reject(new Error(`Gateway URL 非法：${gatewayUrl}（必须以 ws:// 或 wss:// 开头）`))
+      return
+    }
+
     let ws: WebSocket | null = null
     let connectSent = false
     let connected = false
@@ -58,10 +96,14 @@ export async function sendToGateway(text: string, s: Settings): Promise<string> 
     }, 30000)
 
     try {
-      ws = new WebSocket(s.gateway.url)
+      ws = new WebSocket(gatewayUrl)
     } catch (err) {
       finish(() =>
-        reject(err instanceof Error ? err : new Error('Gateway connection failed'))
+        reject(
+          err instanceof Error
+            ? err
+            : new Error(`Gateway connection failed (${gatewayUrl})`)
+        )
       )
       return
     }
@@ -87,51 +129,85 @@ export async function sendToGateway(text: string, s: Settings): Promise<string> 
         return
       }
 
-      if (data?.type === 'error' || data?.error) {
-        finish(() =>
-          reject(new Error(data?.message || data?.error || 'Gateway error'))
-        )
+      if (data?.type === 'error') {
+        finish(() => reject(new Error(getGatewayErrorMessage(data))))
         return
       }
 
       if (data?.type === 'event' && data?.event === 'connect.challenge') {
         if (connectSent) return
         connectSent = true
-        try {
-          sendFrame({
-            type: 'req',
-            id: connectReqId,
-            method: 'connect',
-            params: {
-              minProtocol: 3,
-              maxProtocol: 3,
-              client: {
-                id: 'webchat-ui',
-                displayName: 'Haji Voice',
-                version: '1.0.0',
-                platform: 'web',
-                mode: 'ui',
-                instanceId,
-              },
+        const requestedScopes = [...OPERATOR_SCOPES]
+        const nonce = typeof data?.payload?.nonce === 'string' ? data.payload.nonce : ''
+        void (async () => {
+          try {
+            const device = await buildGatewayDeviceAuth({
+              clientId: 'webchat-ui',
+              clientMode: 'ui',
               role: 'operator',
-              scopes: ['operator.read', 'operator.write'],
-              caps: [],
-              commands: [],
-              permissions: {},
-              auth: { token: s.gateway.token },
-              locale: 'zh-CN',
-              userAgent: 'haji-voice/1.0.0',
-            },
-          })
-        } catch {
-          finish(() => reject(new Error('Gateway connect send failed')))
-        }
+              scopes: requestedScopes,
+              token: gatewayToken || null,
+              nonce,
+            })
+            if (settled || ws?.readyState !== WebSocket.OPEN) return
+            sendFrame({
+              type: 'req',
+              id: connectReqId,
+              method: 'connect',
+              params: {
+                minProtocol: 3,
+                maxProtocol: 3,
+                client: {
+                  id: 'webchat-ui',
+                  displayName: 'Haji Voice',
+                  version: '1.0.0',
+                  platform: 'web',
+                  mode: 'ui',
+                  instanceId,
+                },
+                role: 'operator',
+                scopes: requestedScopes,
+                caps: [],
+                commands: [],
+                permissions: {},
+                auth: { token: gatewayToken },
+                locale: 'zh-CN',
+                userAgent: 'haji-voice/1.0.0',
+                device,
+              },
+            })
+          } catch (err) {
+            finish(() =>
+              reject(
+                err instanceof Error ? err : new Error('Gateway connect send failed')
+              )
+            )
+          }
+        })()
         return
       }
 
       if (data?.type === 'res' && data?.id === connectReqId) {
         if (!data?.ok) {
-          finish(() => reject(new Error(data?.error?.message || 'Gateway connect failed')))
+          const info = getGatewayErrorInfo(data, 'Gateway connect failed')
+          const code = (info.code || '').toUpperCase()
+          const detailCode = (info.detailCode || '').toUpperCase()
+          const pairingRequired =
+            code === 'NOT_PAIRED' ||
+            detailCode === 'PAIRING_REQUIRED' ||
+            info.message.toLowerCase().includes('pairing required')
+          if (pairingRequired) {
+            const requestHint = info.requestId ? `（requestId: ${info.requestId}）` : ''
+            finish(() =>
+              reject(
+                new Error(
+                  `网关要求先配对设备${requestHint}。请在网关机器执行：openclaw devices approve --latest`
+                )
+              )
+            )
+          } else {
+            finish(() => reject(new Error(info.message)))
+          }
           return
         }
         if (data?.payload?.type !== 'hello-ok') {
@@ -145,6 +221,7 @@ export async function sendToGateway(text: string, s: Settings): Promise<string> 
             id: chatReqId,
             method: 'chat.send',
             params: {
+              sessionKey: DEFAULT_GATEWAY_SESSION_KEY,
               message: text,
               idempotencyKey,
             },
@@ -157,7 +234,7 @@ export async function sendToGateway(text: string, s: Settings): Promise<string> 
 
       if (data?.type === 'res' && data?.id === chatReqId) {
         if (!data?.ok) {
-          finish(() => reject(new Error(data?.error?.message || 'Gateway chat.send failed')))
+          finish(() => reject(new Error(getGatewayErrorMessage(data, 'Gateway chat.send failed'))))
           return
         }
         if (typeof data?.payload?.runId === 'string') {
@@ -169,15 +246,24 @@ export async function sendToGateway(text: string, s: Settings): Promise<string> 
       if (data?.type === 'event' && data?.event === 'chat') {
         const payload = data?.payload
         if (!payload) return
-        const eventRunId = typeof payload.runId === 'string' ? payload.runId : ''
+        const parsed = parseGatewayChatPayload(payload)
+        const eventRunId = parsed.runId
         if (runId && eventRunId && runId !== eventRunId) return
         if (!runId && eventRunId) runId = eventRunId
-        if (payload.type === 'delta' && typeof payload.text === 'string') {
-          buffer += payload.text
+        if (parsed.state === 'delta') {
+          if (parsed.text) buffer = parsed.text
           return
         }
-        if (payload.type === 'done') {
-          const reply = buffer.trim()
+        if (parsed.state === 'aborted') {
+          finish(() => reject(new Error('Gateway response aborted')))
+          return
+        }
+        if (parsed.state === 'error') {
+          finish(() => reject(new Error(parsed.errorMessage || 'Gateway response failed')))
+          return
+        }
+        if (parsed.state === 'final') {
+          const reply = (parsed.text || buffer).trim()
           if (reply) {
             finish(() => resolve(reply))
             return
@@ -205,7 +291,11 @@ export async function summarize(
     body: JSON.stringify({
       model: s.llm.model,
       messages: [
-        { role: 'system', content: '用一两句话简洁地总结以下内容，保留关键信息：' },
+        {
+          role: 'system',
+          content:
+            '用一两句话简洁总结以下内容，保留关键信息。若原文包含问题、反问或需要用户确认的问句，必须原样保留问题意图与问句语气，不要改写成陈述句。',
+        },
         { role: 'user', content: text },
       ],
       max_tokens: 200,
@@ -222,16 +312,27 @@ export async function textToSpeech(
   s: Settings,
   signal?: AbortSignal
 ): Promise<ArrayBuffer> {
+  const model = s.tts.model.trim() || DEFAULT_SETTINGS.tts.model
+  const voice = s.tts.voice.trim() || DEFAULT_SETTINGS.tts.voice
+  const speed = Number.isFinite(s.tts.speed)
+    ? Math.min(4, Math.max(0.25, s.tts.speed))
+    : DEFAULT_SETTINGS.tts.speed
+  const gain = Number.isFinite(s.tts.gain)
+    ? Math.min(10, Math.max(-10, s.tts.gain))
+    : DEFAULT_SETTINGS.tts.gain
   const res = await fetch(`${s.tts.baseURL}/audio/speech`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${s.tts.apiKey}`,
     },
-    body: JSON.stringify({ model: 'tts-1', input: text, voice: s.tts.voice }),
+    body: JSON.stringify({ model, input: text, voice, speed, gain }),
     signal,
   })
-  if (!res.ok) throw new Error(`TTS error: ${res.status}`)
+  if (!res.ok) {
+    const detail = await readApiErrorMessage(res)
+    throw new Error(detail ? `TTS error: ${res.status} - ${detail}` : `TTS error: ${res.status}`)
+  }
   return res.arrayBuffer()
 }
 

@@ -5,6 +5,6 @@ export default defineConfig({
   plugins: [react()],
   base: '/talk/',
   optimizeDeps: {
-    exclude: ['@ricky0123/vad-web'],
+    include: ['@ricky0123/vad-web'],
   },
 })

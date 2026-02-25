@@ -2,7 +2,16 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import SettingsPage from './SettingsPage'
 import { loadSettings } from './settings'
 import { transcribeAudio, summarize, textToSpeech, playAudio } from './api'
-import { MicVAD, utils } from '@ricky0123/vad-web'
+import {
+  buildGatewayDeviceAuth,
+  DEFAULT_GATEWAY_SESSION_KEY,
+  getGatewayErrorInfo,
+  getGatewayErrorMessage,
+  OPERATOR_SCOPES,
+  parseGatewayChatPayload,
+} from './gatewayProtocol'
+import * as vadWeb from '@ricky0123/vad-web'
+import type { MicVAD as MicVADType } from '@ricky0123/vad-web'
 import * as ort from 'onnxruntime-web'
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected'
@@ -59,6 +68,7 @@ export default function App() {
   const [verboseNext, setVerboseNext] = useState(false)
   const [error, setError] = useState('')
   const [vadAvailable, setVadAvailable] = useState(true)
+  const [gatewayUrlHint, setGatewayUrlHint] = useState(() => loadSettings().gateway.url.trim())
 
   const mediaRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
@@ -78,13 +88,35 @@ export default function App() {
   const reconnectTimerRef = useRef<number | null>(null)
   const connectGatewayRef = useRef<() => void>(() => {})
 
-  const vadRef = useRef<MicVAD | null>(null)
+  const vadRef = useRef<MicVADType | null>(null)
 
   const addMsg = (role: 'user' | 'ai', text: string) =>
     setMessages(prev => {
       const next = [...prev, { id: createMessageId(), role, text }]
       return next.slice(-MAX_MESSAGES)
     })
+
+  const playSendBeep = useCallback(() => {
+    try {
+      const ctx = new AudioContext()
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      osc.type = 'sine'
+      osc.frequency.setValueAtTime(1160, ctx.currentTime)
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime)
+      gain.gain.exponentialRampToValueAtTime(0.06, ctx.currentTime + 0.012)
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.14)
+      osc.connect(gain)
+      gain.connect(ctx.destination)
+      osc.start()
+      osc.stop(ctx.currentTime + 0.14)
+      osc.onended = () => {
+        void ctx.close()
+      }
+    } catch {
+      // ignore beep errors
+    }
+  }, [])
 
   useEffect(() => {
     loopStatusRef.current = loopStatus
@@ -119,6 +151,12 @@ export default function App() {
       return next
     })
   }, [messages])
+
+  useEffect(() => {
+    if (!showSettings) {
+      setGatewayUrlHint(loadSettings().gateway.url.trim())
+    }
+  }, [showSettings])
 
   useEffect(() => {
     return () => {
@@ -217,18 +255,20 @@ export default function App() {
             id: chatReqId,
             method: 'chat.send',
             params: {
+              sessionKey: DEFAULT_GATEWAY_SESSION_KEY,
               message: text,
               idempotencyKey,
             },
           })
         )
+        playSendBeep()
       } catch (err) {
         window.clearTimeout(timeoutId)
         pendingChatRef.current = null
         reject(err instanceof Error ? err : new Error('Gateway message send failed'))
       }
     })
-  }, [])
+  }, [playSendBeep])
 
   const processAudio = useCallback(
     async (blob: Blob) => {
@@ -255,16 +295,25 @@ export default function App() {
         const reply = await sendGatewayMessage(text)
         if (runId !== activeRunIdRef.current || abortRef.current) return
 
+        addMsg('ai', reply)
         const verbose = verboseNext
         setVerboseNext(false)
         let toSpeak = reply
-        if (!verbose) {
+        const shouldSummarize = !verbose && reply.trim().length > s.summary.thresholdChars
+        if (shouldSummarize) {
           const llmController = new AbortController()
           abortControllersRef.current.llm = llmController
-          toSpeak = await summarize(reply, s, llmController.signal)
+          try {
+            const summarized = await summarize(reply, s, llmController.signal)
+            if (summarized.trim()) toSpeak = summarized.trim()
+          } catch (err) {
+            if (llmController.signal.aborted || abortRef.current || runId !== activeRunIdRef.current) {
+              throw err
+            }
+            toSpeak = reply
+          }
         }
         if (runId !== activeRunIdRef.current || abortRef.current) return
-        addMsg('ai', toSpeak)
 
         setLoopStatus('speaking')
         const ttsController = new AbortController()
@@ -322,6 +371,9 @@ export default function App() {
 
   const handleSpeechStart = useCallback(() => {
     if (!connectedRef.current) return
+    // Only allow barge-in while currently speaking. During thinking/recognizing,
+    // false-positive VAD starts could cancel a valid turn before TTS is requested.
+    if (loopStatusRef.current !== 'speaking') return
     stopPlayback()
     cancelInFlight('Interrupted by speech')
     setLoopStatus('listening')
@@ -330,7 +382,7 @@ export default function App() {
   const handleSpeechEnd = useCallback(
     (audio: Float32Array) => {
       if (!connectedRef.current) return
-      const wav = utils.encodeWAV(audio, 1, 16000, 1, 16)
+      const wav = vadWeb.utils.encodeWAV(audio, 1, 16000, 1, 16)
       const blob = new Blob([wav], { type: 'audio/wav' })
       void processAudio(blob)
     },
@@ -340,11 +392,16 @@ export default function App() {
   const initVad = useCallback(async () => {
     if (vadRef.current) return
     try {
-      ort.env.wasm.wasmPaths = '/talk/'
-      const vad = await MicVAD.new({
+      const assetBasePath = import.meta.env.BASE_URL
+      const onnxWasmBasePath = import.meta.env.DEV
+        ? `${assetBasePath}node_modules/onnxruntime-web/dist/`
+        : assetBasePath
+
+      ort.env.wasm.wasmPaths = onnxWasmBasePath
+      const vad = await vadWeb.MicVAD.new({
         startOnLoad: false,
-        baseAssetPath: '/talk/',
-        onnxWASMBasePath: '/talk/',
+        baseAssetPath: assetBasePath,
+        onnxWASMBasePath: onnxWasmBasePath,
         onSpeechStart: handleSpeechStart,
         onSpeechEnd: handleSpeechEnd,
       })
@@ -403,6 +460,12 @@ export default function App() {
         setLoopStatus('idle')
         return
       }
+      if (event && event.code === 1008) {
+        setConnectionStatus('disconnected')
+        setLoopStatus('idle')
+        void stopVad()
+        return
+      }
       setConnectionStatus('connecting')
       setLoopStatus('idle')
       if (event && event.code !== 1000) {
@@ -417,6 +480,19 @@ export default function App() {
   const connectGateway = useCallback(() => {
     if (connectionStatus === 'connected' || connectionStatus === 'connecting') return
     const s = loadSettings()
+    const gatewayUrl = typeof s.gateway.url === 'string' ? s.gateway.url.trim() : ''
+    const gatewayToken = typeof s.gateway.token === 'string' ? s.gateway.token.trim() : ''
+    setGatewayUrlHint(gatewayUrl)
+    if (!gatewayUrl) {
+      setError('Gateway URL 为空，请在设置中填写 wss://... 地址')
+      setConnectionStatus('disconnected')
+      return
+    }
+    if (!/^wss?:\/\//i.test(gatewayUrl)) {
+      setError(`Gateway URL 非法：${gatewayUrl}（必须以 ws:// 或 wss:// 开头）`)
+      setConnectionStatus('disconnected')
+      return
+    }
     disconnectRequestedRef.current = false
     setError('')
     setConnectionStatus('connecting')
@@ -425,9 +501,9 @@ export default function App() {
 
     let ws: WebSocket
     try {
-      ws = new WebSocket(s.gateway.url)
+      ws = new WebSocket(gatewayUrl)
     } catch (err: any) {
-      setError(err?.message || 'Gateway connection failed')
+      setError((err?.message || 'Gateway connection failed') + ` (${gatewayUrl})`)
       setConnectionStatus('disconnected')
       return
     }
@@ -437,7 +513,7 @@ export default function App() {
     ws.onopen = () => {}
 
     ws.onerror = () => {
-      setError('Gateway connection error')
+      setError(`Gateway connection error (${gatewayUrl})`)
     }
 
     ws.onclose = event => {
@@ -453,51 +529,98 @@ export default function App() {
         return
       }
 
-      if (data?.type === 'error' || data?.error) {
-        setError(data?.message || data?.error || 'Gateway error')
+      if (data?.type === 'error') {
+        setError(getGatewayErrorMessage(data))
         return
       }
 
       if (data?.type === 'event' && data?.event === 'connect.challenge') {
         if (connectSentRef.current) return
         connectSentRef.current = true
-        try {
-          ws.send(
-            JSON.stringify({
-              type: 'req',
-              id: '1',
-              method: 'connect',
-              params: {
-                minProtocol: 3,
-                maxProtocol: 3,
-                client: {
-                  id: 'webchat-ui',
-                  displayName: 'Haji Voice',
-                  version: '1.0.0',
-                  platform: 'web',
-                  mode: 'ui',
-                  instanceId,
-                },
-                role: 'operator',
-                scopes: ['operator.read', 'operator.write'],
-                caps: [],
-                commands: [],
-                permissions: {},
-                auth: { token: s.gateway.token },
-                locale: 'zh-CN',
-                userAgent: 'haji-voice/1.0.0',
-              },
+        const requestedScopes = [...OPERATOR_SCOPES]
+        const nonce = typeof data?.payload?.nonce === 'string' ? data.payload.nonce : ''
+        void (async () => {
+          try {
+            const device = await buildGatewayDeviceAuth({
+              clientId: 'webchat-ui',
+              clientMode: 'ui',
+              role: 'operator',
+              scopes: requestedScopes,
+              token: gatewayToken || null,
+              nonce,
             })
-          )
-        } catch {
-          setError('Gateway connect send failed')
-        }
+            if (ws.readyState !== WebSocket.OPEN) return
+            ws.send(
+              JSON.stringify({
+                type: 'req',
+                id: '1',
+                method: 'connect',
+                params: {
+                  minProtocol: 3,
+                  maxProtocol: 3,
+                  client: {
+                    id: 'webchat-ui',
+                    displayName: 'Haji Voice',
+                    version: '1.0.0',
+                    platform: 'web',
+                    mode: 'ui',
+                    instanceId,
+                  },
+                  role: 'operator',
+                  scopes: requestedScopes,
+                  caps: [],
+                  commands: [],
+                  permissions: {},
+                  auth: { token: gatewayToken },
+                  locale: 'zh-CN',
+                  userAgent: 'haji-voice/1.0.0',
+                  device,
+                },
+              })
+            )
+          } catch (err: any) {
+            connectSentRef.current = false
+            disconnectRequestedRef.current = true
+            setConnectionStatus('disconnected')
+            setLoopStatus('idle')
+            setError(err?.message || 'Gateway connect send failed')
+            try {
+              ws.close(1008, 'connect auth failed')
+            } catch {
+              // ignore
+            }
+          }
+        })()
         return
       }
 
       if (data?.type === 'res' && data?.id === '1') {
         if (!data?.ok) {
-          setError(data?.error?.message || 'Gateway connect failed')
+          const info = getGatewayErrorInfo(data, 'Gateway connect failed')
+          const code = (info.code || '').toUpperCase()
+          const detailCode = (info.detailCode || '').toUpperCase()
+          const pairingRequired =
+            code === 'NOT_PAIRED' ||
+            detailCode === 'PAIRING_REQUIRED' ||
+            info.message.toLowerCase().includes('pairing required')
+          if (pairingRequired) {
+            const requestHint = info.requestId ? `（requestId: ${info.requestId}）` : ''
+            setError(
+              `网关要求先配对设备${requestHint}。请在网关机器执行：openclaw devices approve --latest`
+            )
+          } else {
+            setError(info.message)
+          }
+          disconnectRequestedRef.current = true
+          connectedRef.current = false
+          connectSentRef.current = false
+          setConnectionStatus('disconnected')
+          setLoopStatus('idle')
+          try {
+            ws.close(1008, 'connect rejected')
+          } catch {
+            // ignore
+          }
           return
         }
         if (data?.payload?.type !== 'hello-ok') {
@@ -517,7 +640,7 @@ export default function App() {
           if (!pending) return
           pendingChatRef.current = null
           window.clearTimeout(pending.timeoutId)
-          pending.reject(new Error(data?.error?.message || 'Gateway chat.send failed'))
+          pending.reject(new Error(getGatewayErrorMessage(data, 'Gateway chat.send failed')))
           return
         }
         if (typeof data?.payload?.runId === 'string' && pendingChatRef.current) {
@@ -529,23 +652,40 @@ export default function App() {
       if (data?.type === 'event' && data?.event === 'chat') {
         const payload = data?.payload
         if (!payload || !pendingChatRef.current) return
-        const eventRunId = typeof payload.runId === 'string' ? payload.runId : ''
+        const parsed = parseGatewayChatPayload(payload)
+        const eventRunId = parsed.runId
         if (pendingChatRef.current.runId && eventRunId && pendingChatRef.current.runId !== eventRunId) {
           return
         }
         if (!pendingChatRef.current.runId && eventRunId) {
           pendingChatRef.current.runId = eventRunId
         }
-        if (payload.type === 'delta' && typeof payload.text === 'string') {
-          pendingChatRef.current.buffer += payload.text
+        if (parsed.state === 'delta') {
+          if (parsed.text) pendingChatRef.current.buffer = parsed.text
           return
         }
-        if (payload.type === 'done') {
+        if (parsed.state === 'aborted') {
           const pending = pendingChatRef.current
           if (!pending) return
           pendingChatRef.current = null
           window.clearTimeout(pending.timeoutId)
-          const reply = pending.buffer.trim()
+          pending.reject(new Error('Gateway response aborted'))
+          return
+        }
+        if (parsed.state === 'error') {
+          const pending = pendingChatRef.current
+          if (!pending) return
+          pendingChatRef.current = null
+          window.clearTimeout(pending.timeoutId)
+          pending.reject(new Error(parsed.errorMessage || 'Gateway response failed'))
+          return
+        }
+        if (parsed.state === 'final') {
+          const pending = pendingChatRef.current
+          if (!pending) return
+          pendingChatRef.current = null
+          window.clearTimeout(pending.timeoutId)
+          const reply = (parsed.text || pending.buffer).trim()
           if (reply) pending.resolve(reply)
           else pending.reject(new Error('Gateway response missing reply text'))
         }
@@ -634,76 +774,62 @@ export default function App() {
         </header>
 
         <main className="flex min-h-0 flex-1 flex-col gap-4 pb-6">
-          <section className="rounded-2xl border border-white/10 bg-card/70 p-6">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
-                  Continuous Mode
-                </p>
-                <h2 className="mt-2 text-base font-semibold">持续免手持对话</h2>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {connectionStatus === 'connected'
-                    ? '保持连接，自动监听与播报'
-                    : '点击连接后直接开口说话'}
-                </p>
-                <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <span
-                    className={`rounded-full border px-3 py-1 text-[10px] uppercase tracking-[0.3em] ${
-                      connectionStatus === 'connected'
-                        ? 'border-accent/60 text-accent'
-                        : 'border-white/10 text-muted-foreground'
-                    }`}
-                  >
-                    {loopStatusLabel}
-                  </span>
-                  {verboseNext && (
-                    <span className="rounded-full border border-white/10 px-3 py-1 text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
-                      下次详细播报
-                    </span>
-                  )}
-                  {manualMode && (
-                    <span className="rounded-full border border-white/10 px-3 py-1 text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
-                      手动模式
-                    </span>
-                  )}
-                </div>
-              </div>
-              <div className="flex flex-col items-center gap-3">
+          <section className="rounded-2xl border border-white/10 bg-card/70 px-4 py-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
+                Continuous
+              </p>
+              <span
+                className={`rounded-full border px-3 py-1 text-[10px] uppercase tracking-[0.3em] ${
+                  connectionStatus === 'connected'
+                    ? 'border-accent/60 text-accent'
+                    : 'border-white/10 text-muted-foreground'
+                }`}
+              >
+                {loopStatusLabel}
+              </span>
+              {verboseNext && (
+                <span className="rounded-full border border-white/10 px-3 py-1 text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
+                  下次详细播报
+                </span>
+              )}
+              {manualMode && (
+                <span className="rounded-full border border-white/10 px-3 py-1 text-[10px] uppercase tracking-[0.3em] text-muted-foreground">
+                  手动模式
+                </span>
+              )}
+              <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+                网关：{gatewayUrlHint || '未配置'}
+              </span>
+              {manualMode && (
                 <button
                   type="button"
-                  onClick={toggleConnection}
-                  disabled={connectionStatus === 'connecting'}
-                  className={`relative flex h-24 w-48 items-center justify-center rounded-full border text-sm font-semibold tracking-[0.35em] transition ${
-                    connectionStatus === 'connected'
-                      ? 'border-accent text-accent shadow-[0_0_45px_rgba(0,212,255,0.7)]'
-                      : 'border-accent/60 text-accent/80 shadow-[0_0_26px_rgba(0,212,255,0.35)]'
-                  } ${connectionStatus === 'connecting' ? 'opacity-60' : 'hover:scale-[1.02]'}`}
+                  onClick={toggleManualListen}
+                  disabled={connectionStatus !== 'connected' || (loopStatus !== 'idle' && loopStatus !== 'listening')}
+                  className={`rounded-full border px-3 py-1 text-[10px] uppercase tracking-[0.28em] transition ${
+                    loopStatus === 'listening'
+                      ? 'border-accent text-accent'
+                      : 'border-white/10 text-muted-foreground'
+                  } ${connectionStatus !== 'connected' ? 'opacity-50' : 'hover:text-foreground'}`}
                 >
-                  {connectionStatus === 'connected' ? '断开' : '连接'}
-                  {connectionStatus === 'connected' && (loopStatus === 'listening' || loopStatus === 'idle') && (
-                    <span className="absolute inset-0 -z-10 rounded-full border border-accent/40 opacity-70 animate-pulse" />
-                  )}
+                  {loopStatus === 'listening' ? '结束录音' : '手动录音'}
                 </button>
-                {manualMode && (
-                  <button
-                    type="button"
-                    onClick={toggleManualListen}
-                    disabled={
-                      connectionStatus !== 'connected' || (loopStatus !== 'idle' && loopStatus !== 'listening')
-                    }
-                    className={`rounded-full border px-4 py-2 text-[11px] uppercase tracking-[0.3em] transition ${
-                      loopStatus === 'listening'
-                        ? 'border-accent text-accent'
-                        : 'border-white/10 text-muted-foreground'
-                    } ${connectionStatus !== 'connected' ? 'opacity-50' : 'hover:text-foreground'}`}
-                  >
-                    {loopStatus === 'listening' ? '结束录音' : '手动录音'}
-                  </button>
-                )}
-              </div>
+              )}
+              <button
+                type="button"
+                onClick={toggleConnection}
+                disabled={connectionStatus === 'connecting'}
+                className={`relative rounded-full border px-5 py-2 text-xs font-semibold tracking-[0.3em] transition ${
+                  connectionStatus === 'connected'
+                    ? 'border-accent text-accent shadow-[0_0_24px_rgba(0,212,255,0.5)]'
+                    : 'border-accent/60 text-accent/80'
+                } ${connectionStatus === 'connecting' ? 'opacity-60' : 'hover:scale-[1.02]'}`}
+              >
+                {connectionStatus === 'connected' ? '断开' : '连接'}
+              </button>
             </div>
             {error && (
-              <div className="mt-4 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+              <div className="mt-2 rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
                 {error}
               </div>
             )}
@@ -717,17 +843,6 @@ export default function App() {
                 </p>
                 <h2 className="mt-2 text-base font-semibold">对话记录</h2>
                 <p className="mt-1 text-xs text-muted-foreground">最近 10 条信息</p>
-              </div>
-              <div className="flex items-center gap-2">
-                <span
-                  className={`rounded-full border px-3 py-1 text-[10px] uppercase tracking-[0.3em] ${
-                    connectionStatus === 'connected'
-                      ? 'border-accent/60 text-accent'
-                      : 'border-white/10 text-muted-foreground'
-                  }`}
-                >
-                  {loopStatusLabel}
-                </span>
               </div>
             </div>
 

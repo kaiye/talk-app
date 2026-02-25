@@ -1,6 +1,6 @@
 import React from 'react'
 import type { Settings } from './settings'
-import { loadSettings, saveSettings } from './settings'
+import { DEFAULT_SETTINGS, loadSettings, saveSettings } from './settings'
 
 interface Props {
   onClose: () => void
@@ -13,14 +13,47 @@ export default function SettingsPage({ onClose }: Props) {
   )
   const [helpOpen, setHelpOpen] = React.useState(false)
 
-  function update(path: string, value: string) {
+  function update(path: string, value: string | number) {
     const [section, key] = path.split('.')
     setS(prev => ({ ...prev, [section]: { ...(prev as any)[section], [key]: value } }))
+  }
+
+  function parseThreshold(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return Math.max(0, Math.floor(value))
+    }
+    if (typeof value === 'string') {
+      const parsed = Number.parseInt(value.trim(), 10)
+      if (Number.isFinite(parsed)) return Math.max(0, parsed)
+    }
+    return null
+  }
+
+  function parseBoundedNumber(value: unknown, min: number, max: number): number | null {
+    const parsed =
+      typeof value === 'number'
+        ? value
+        : typeof value === 'string'
+          ? Number.parseFloat(value.trim())
+          : Number.NaN
+    if (!Number.isFinite(parsed)) return null
+    return Math.min(max, Math.max(min, parsed))
   }
 
   function save() {
     saveSettings(s)
     onClose()
+  }
+
+  function resetApiDefaults() {
+    setS(prev => ({
+      ...prev,
+      asr: { ...DEFAULT_SETTINGS.asr, apiKey: '' },
+      llm: { ...DEFAULT_SETTINGS.llm, apiKey: '' },
+      tts: { ...DEFAULT_SETTINGS.tts, apiKey: '' },
+      gateway: { ...prev.gateway, url: DEFAULT_SETTINGS.gateway.url },
+    }))
+    showToast('success', '已重置默认 API 配置，请填写 API Key')
   }
 
   function showToast(type: 'success' | 'error', text: string) {
@@ -50,10 +83,8 @@ export default function SettingsPage({ onClose }: Props) {
     if (text.startsWith('{')) {
       try {
         const parsed = JSON.parse(text) as Record<string, unknown>
-        const updates: Array<{ path: string; value: string }> = []
+        const updates: Array<{ path: string; value: string | number }> = []
         const filled: string[] = []
-        const isNestedFormat =
-          'asr' in parsed || 'llm' in parsed || 'tts' in parsed || 'gateway' in parsed
 
         const pushUpdate = (path: string, value: unknown, label: string) => {
           if (typeof value === 'string' && value.trim()) {
@@ -62,63 +93,47 @@ export default function SettingsPage({ onClose }: Props) {
           }
         }
 
-        if (isNestedFormat) {
-          const asr = parsed.asr as Record<string, unknown> | undefined
-          const llm = parsed.llm as Record<string, unknown> | undefined
-          const tts = parsed.tts as Record<string, unknown> | undefined
-          const gateway = parsed.gateway as Record<string, unknown> | undefined
+        const asr = parsed.asr as Record<string, unknown> | undefined
+        const llm = parsed.llm as Record<string, unknown> | undefined
+        const tts = parsed.tts as Record<string, unknown> | undefined
+        const gateway = parsed.gateway as Record<string, unknown> | undefined
+        const summary = parsed.summary as Record<string, unknown> | undefined
 
-          if (asr) {
-            pushUpdate('asr.baseURL', asr.baseURL, 'ASR Base URL')
-            pushUpdate('asr.apiKey', asr.apiKey, 'ASR API Key')
-            pushUpdate('asr.model', asr.model, 'ASR Model')
+        if (asr) {
+          pushUpdate('asr.baseURL', asr.baseURL, 'ASR Base URL')
+          pushUpdate('asr.apiKey', asr.apiKey, 'ASR API Key')
+          pushUpdate('asr.model', asr.model, 'ASR Model')
+        }
+        if (llm) {
+          pushUpdate('llm.baseURL', llm.baseURL, 'LLM Base URL')
+          pushUpdate('llm.apiKey', llm.apiKey, 'LLM API Key')
+          pushUpdate('llm.model', llm.model, 'LLM Model')
+        }
+        if (tts) {
+          pushUpdate('tts.baseURL', tts.baseURL, 'TTS Base URL')
+          pushUpdate('tts.apiKey', tts.apiKey, 'TTS API Key')
+          pushUpdate('tts.model', tts.model, 'TTS Model')
+          pushUpdate('tts.voice', tts.voice, 'TTS Voice')
+          const speed = parseBoundedNumber(tts.speed, 0.25, 4)
+          if (speed !== null) {
+            updates.push({ path: 'tts.speed', value: speed })
+            filled.push('TTS Speed')
           }
-          if (llm) {
-            pushUpdate('llm.baseURL', llm.baseURL, 'LLM Base URL')
-            pushUpdate('llm.apiKey', llm.apiKey, 'LLM API Key')
-            pushUpdate('llm.model', llm.model, 'LLM Model')
+          const gain = parseBoundedNumber(tts.gain, -10, 10)
+          if (gain !== null) {
+            updates.push({ path: 'tts.gain', value: gain })
+            filled.push('TTS Gain')
           }
-          if (tts) {
-            pushUpdate('tts.baseURL', tts.baseURL, 'TTS Base URL')
-            pushUpdate('tts.apiKey', tts.apiKey, 'TTS API Key')
-            pushUpdate('tts.voice', tts.voice, 'TTS Voice')
-          }
-          if (gateway) {
-            pushUpdate('gateway.url', gateway.url, 'Gateway URL')
-            pushUpdate('gateway.token', gateway.token, 'Gateway Token')
-          }
-        } else {
-          if (typeof parsed.baseURL === 'string' && parsed.baseURL.trim()) {
-            updates.push(
-              { path: 'asr.baseURL', value: parsed.baseURL },
-              { path: 'llm.baseURL', value: parsed.baseURL },
-              { path: 'tts.baseURL', value: parsed.baseURL }
-            )
-            filled.push('Base URL（ASR/LLM/TTS）')
-          }
-          if (typeof parsed.apiKey === 'string' && parsed.apiKey.trim()) {
-            updates.push(
-              { path: 'asr.apiKey', value: parsed.apiKey },
-              { path: 'llm.apiKey', value: parsed.apiKey },
-              { path: 'tts.apiKey', value: parsed.apiKey }
-            )
-            filled.push('API Key（ASR/LLM/TTS）')
-          }
-          if (typeof parsed.llmModel === 'string' && parsed.llmModel.trim()) {
-            updates.push({ path: 'llm.model', value: parsed.llmModel })
-            filled.push('LLM Model')
-          }
-          if (typeof parsed.ttsVoice === 'string' && parsed.ttsVoice.trim()) {
-            updates.push({ path: 'tts.voice', value: parsed.ttsVoice })
-            filled.push('TTS Voice')
-          }
-          if (typeof parsed.gatewayUrl === 'string' && parsed.gatewayUrl.trim()) {
-            updates.push({ path: 'gateway.url', value: parsed.gatewayUrl })
-            filled.push('Gateway URL')
-          }
-          if (typeof parsed.gatewayToken === 'string' && parsed.gatewayToken.trim()) {
-            updates.push({ path: 'gateway.token', value: parsed.gatewayToken })
-            filled.push('Gateway Token')
+        }
+        if (gateway) {
+          pushUpdate('gateway.url', gateway.url, 'Gateway URL')
+          pushUpdate('gateway.token', gateway.token, 'Gateway Token')
+        }
+        if (summary) {
+          const threshold = parseThreshold(summary.thresholdChars)
+          if (threshold !== null) {
+            updates.push({ path: 'summary.thresholdChars', value: threshold })
+            filled.push('摘要阈值')
           }
         }
 
@@ -204,6 +219,13 @@ export default function SettingsPage({ onClose }: Props) {
                 >
                   📋 一键粘贴配置
                 </button>
+                <button
+                  type="button"
+                  onClick={resetApiDefaults}
+                  className="inline-flex items-center gap-2 rounded-xl border border-white/20 bg-black/60 px-4 py-3 text-sm font-semibold text-foreground transition hover:bg-white/5"
+                >
+                  ↺ 重置默认
+                </button>
                 <div className="relative group">
                   <button
                     type="button"
@@ -223,20 +245,11 @@ export default function SettingsPage({ onClose }: Props) {
                     </p>
                     <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-cyan-100/90">
 {`{
-  "asr": { "baseURL": "https://api.siliconflow.cn/v1", "apiKey": "sk-xxx", "model": "whisper-1" },
+  "asr": { "baseURL": "https://api.siliconflow.cn/v1", "apiKey": "sk-xxx", "model": "FunAudioLLM/SenseVoiceSmall" },
   "llm": { "baseURL": "https://api.siliconflow.cn/v1", "apiKey": "sk-xxx", "model": "Qwen/Qwen2.5-7B-Instruct" },
-  "tts": { "baseURL": "https://api.siliconflow.cn/v1", "apiKey": "sk-xxx", "voice": "FunAudioLLM/CosyVoice2-0.5B:alex" },
-  "gateway": { "url": "wss://oc.dingsum.com", "token": "..." }
-}
-
-旧版（仍支持）:
-{
-  "baseURL": "https://api.siliconflow.cn/v1",
-  "apiKey": "sk-xxx",
-  "llmModel": "Qwen/Qwen2.5-7B-Instruct",
-  "ttsVoice": "FunAudioLLM/CosyVoice2-0.5B:alex",
-  "gatewayUrl": "wss://oc.dingsum.com",
-  "gatewayToken": "..."
+  "tts": { "baseURL": "https://api.siliconflow.cn/v1", "apiKey": "sk-xxx", "model": "FunAudioLLM/CosyVoice2-0.5B", "voice": "FunAudioLLM/CosyVoice2-0.5B:alex", "speed": 1.0, "gain": 0.0 },
+  "gateway": { "url": "wss://oc.dingsum.com", "token": "..." },
+  "summary": { "thresholdChars": 100 }
 }`}
                     </pre>
                   </div>
@@ -277,7 +290,7 @@ export default function SettingsPage({ onClose }: Props) {
                 <p className="mt-2 text-xs text-muted-foreground">语音转文字服务配置。</p>
               </div>
               <div className="grid gap-4 md:grid-cols-2">
-                {field('API Base URL', 'asr.baseURL', 'https://api.openai.com/v1')}
+                {field('API Base URL', 'asr.baseURL', 'https://api.siliconflow.cn/v1')}
                 {field('API Key', 'asr.apiKey', 'sk-...')}
                 {field('ASR Model', 'asr.model', 'FunAudioLLM/SenseVoiceSmall')}
               </div>
@@ -288,12 +301,30 @@ export default function SettingsPage({ onClose }: Props) {
                 <h3 className="text-[11px] uppercase tracking-[0.3em] text-muted-foreground">
                   LLM（摘要）
                 </h3>
-                <p className="mt-2 text-xs text-muted-foreground">对话理解与摘要模型。</p>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  对话理解与摘要模型。回复字数超过阈值时才启用摘要。
+                </p>
               </div>
               <div className="grid gap-4 md:grid-cols-2">
-                {field('API Base URL', 'llm.baseURL', 'https://api.openai.com/v1')}
+                {field('API Base URL', 'llm.baseURL', 'https://api.siliconflow.cn/v1')}
                 {field('API Key', 'llm.apiKey', 'sk-...')}
-                {field('Model', 'llm.model', 'gpt-4o-mini')}
+                {field('Model', 'llm.model', 'Qwen/Qwen2.5-7B-Instruct')}
+                <div className="grid gap-2">
+                  <label className="text-[11px] uppercase tracking-[0.25em] text-muted-foreground">
+                    Summary Threshold (Chars)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={s.summary.thresholdChars}
+                    onChange={e => {
+                      const parsed = parseThreshold(e.target.value)
+                      update('summary.thresholdChars', parsed ?? 0)
+                    }}
+                    className="rounded-lg border border-white/10 bg-background/60 px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-accent/60 focus:outline-none focus:ring-1 focus:ring-accent/40"
+                  />
+                </div>
               </div>
             </section>
 
@@ -302,12 +333,50 @@ export default function SettingsPage({ onClose }: Props) {
                 <h3 className="text-[11px] uppercase tracking-[0.3em] text-muted-foreground">
                   TTS（语音合成）
                 </h3>
-                <p className="mt-2 text-xs text-muted-foreground">语音合成与播报配置。</p>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  语音合成与播报配置。按官方文档，voice 使用 `模型名:音色`（如
+                  `fnlp/MOSS-TTSD-v0.5:alex`）。
+                </p>
               </div>
               <div className="grid gap-4 md:grid-cols-2">
-                {field('API Base URL', 'tts.baseURL', 'https://api.openai.com/v1')}
+                {field('API Base URL', 'tts.baseURL', 'https://api.siliconflow.cn/v1')}
                 {field('API Key', 'tts.apiKey', 'sk-...')}
-                {field('Voice', 'tts.voice', 'alloy')}
+                {field('Model', 'tts.model', 'FunAudioLLM/CosyVoice2-0.5B')}
+                {field('Voice', 'tts.voice', 'FunAudioLLM/CosyVoice2-0.5B:alex')}
+                <div className="grid gap-2">
+                  <label className="text-[11px] uppercase tracking-[0.25em] text-muted-foreground">
+                    Speed (0.25-4)
+                  </label>
+                  <input
+                    type="number"
+                    min={0.25}
+                    max={4}
+                    step={0.05}
+                    value={s.tts.speed}
+                    onChange={e => {
+                      const parsed = parseBoundedNumber(e.target.value, 0.25, 4)
+                      if (parsed !== null) update('tts.speed', parsed)
+                    }}
+                    className="rounded-lg border border-white/10 bg-background/60 px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-accent/60 focus:outline-none focus:ring-1 focus:ring-accent/40"
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <label className="text-[11px] uppercase tracking-[0.25em] text-muted-foreground">
+                    Gain dB (-10~10)
+                  </label>
+                  <input
+                    type="number"
+                    min={-10}
+                    max={10}
+                    step={0.5}
+                    value={s.tts.gain}
+                    onChange={e => {
+                      const parsed = parseBoundedNumber(e.target.value, -10, 10)
+                      if (parsed !== null) update('tts.gain', parsed)
+                    }}
+                    className="rounded-lg border border-white/10 bg-background/60 px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-accent/60 focus:outline-none focus:ring-1 focus:ring-accent/40"
+                  />
+                </div>
               </div>
             </section>
           </div>
