@@ -226,7 +226,7 @@ export default function SettingsPage({ onClose }: Props) {
   "asr": { "baseURL": "https://api.siliconflow.cn/v1", "apiKey": "sk-xxx", "model": "whisper-1" },
   "llm": { "baseURL": "https://api.siliconflow.cn/v1", "apiKey": "sk-xxx", "model": "Qwen/Qwen2.5-7B-Instruct" },
   "tts": { "baseURL": "https://api.siliconflow.cn/v1", "apiKey": "sk-xxx", "voice": "FunAudioLLM/CosyVoice2-0.5B:alex" },
-  "gateway": { "url": "...", "token": "..." }
+  "gateway": { "url": "wss://oc.dingsum.com", "token": "..." }
 }
 
 旧版（仍支持）:
@@ -235,7 +235,7 @@ export default function SettingsPage({ onClose }: Props) {
   "apiKey": "sk-xxx",
   "llmModel": "Qwen/Qwen2.5-7B-Instruct",
   "ttsVoice": "FunAudioLLM/CosyVoice2-0.5B:alex",
-  "gatewayUrl": "...",
+  "gatewayUrl": "wss://oc.dingsum.com",
   "gatewayToken": "..."
 }`}
                     </pre>
@@ -259,10 +259,12 @@ export default function SettingsPage({ onClose }: Props) {
                 <h3 className="text-[11px] uppercase tracking-[0.3em] text-muted-foreground">
                   OpenClaw Gateway
                 </h3>
-                <p className="mt-2 text-xs text-muted-foreground">用于转发消息和会话处理。</p>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  用于转发消息和会话处理，格式如 wss://oc.dingsum.com。
+                </p>
               </div>
               <div className="grid gap-4 md:grid-cols-2">
-                {field('Gateway URL', 'gateway.url', 'https://your-gateway.com/api/message')}
+                {field('Gateway URL', 'gateway.url', 'wss://oc.dingsum.com')}
                 {field('Token', 'gateway.token', 'your-token')}
               </div>
             </section>

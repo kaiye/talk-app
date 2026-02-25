@@ -9,7 +9,7 @@ const DEFAULTS: Settings = {
   asr: { baseURL: 'https://api.openai.com/v1', apiKey: '', model: 'FunAudioLLM/SenseVoiceSmall' },
   llm: { baseURL: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini' },
   tts: { baseURL: 'https://api.openai.com/v1', apiKey: '', voice: 'alloy' },
-  gateway: { url: '', token: '' },
+  gateway: { url: 'wss://oc.dingsum.com', token: '' },
 }
 
 export function loadSettings(): Settings {
